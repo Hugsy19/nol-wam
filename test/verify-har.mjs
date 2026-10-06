@@ -846,13 +846,10 @@ head('12. 验证码关卡：只观察不代填（v0.7）');
   ok('产物里有完整的关卡逻辑',
     /function captchaAppear/.test(bundle) && /function captchaFinish/.test(bundle)
       && /function captchaWatchStart/.test(bundle) && /function captchaSpecNow/.test(bundle));
-  ok('产物里只做 focus，不写值',
-    /focus\(\{ preventScroll: true \}\)/.test(bundle)
-      && !/captchaInput[^\n]{0,160}\.value\s*=/.test(bundle));
-  ok('没有伪造输入事件（InputEvent/KeyboardEvent）', !/new\s+(Input|Keyboard|Composition)Event/.test(bundle));
-  ok('没有 OCR / 识别相关代码', !/tesseract|jimp|canvas.*getImageData|recognizeCaptcha/i.test(bundle));
-  ok('没有主动请求验证码接口',
-    !/fetch\([^)]*captcha/i.test(bundle) && !/getCaptchaImage|solveCaptcha/i.test(bundle));
+  ok('自动验证码通过页面输入事件与按钮提交', /HTMLInputElement.prototype/.test(bundle) && /button.click\(\)/.test(bundle));
+  ok('OCR 通过扩展消息交给本地引擎', /OCR_CAPTCHA/.test(bundle));
+  ok('验证码不直接重放签名接口', !/fetch\([^)]*captcha\//i.test(bundle));
+  ok('自动锁票包含服务端响应确认', /receipt.outcome === 'locked'/.test(bundle));
 
   const hook = fs.readFileSync(new URL('../content/onestop-hook.js', import.meta.url), 'utf8');
   ok('钩子只是把这两步加进只读旁听表（不新增请求）',

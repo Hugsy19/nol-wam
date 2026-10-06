@@ -4,7 +4,7 @@
 //                 本文件负责"确保座位页在线 → 下发任务 → 接收命中 → 提醒/记录"。
 //   mode='onSale' 开售倒计时监控：轮询商品页，到点提醒。
 //   mode='returns' 商品页产品级（粗粒度）回流监控：作为没有座位页会话时的兜底。
-// 合规声明：只做"监控 + 提醒 + 定位"，不代用户点选座位、不提交订单、不识别验证码。
+// 本地 OCR 通过 offscreen 工作线程运行；锁票由选座页执行。
 
 import { parseProduct, parseKst } from '../lib/parser.js';
 import { syncTime, ensureTimeSynced, serverNow, timeSyncInfo } from '../lib/time-sync.js';
@@ -371,15 +371,20 @@ chrome.tabs.onRemoved.addListener(() => {
 });
 
 // ---------------- 提示音 ----------------
-async function playSound(times) {
-  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (!contexts.length) {
-    await chrome.offscreen.createDocument({
-      url: 'offscreen/sound.html',
-      reasons: ['AUDIO_PLAYBACK'],
-      justification: '监控命中提示音',
+let offscreenCreating;
+async function ensureOffscreen() {
+  if (offscreenCreating) return offscreenCreating;
+  offscreenCreating = (async () => {
+    const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    if (!contexts.length) await chrome.offscreen.createDocument({
+      url: 'offscreen/sound.html', reasons: ['WORKERS', 'AUDIO_PLAYBACK'],
+      justification: '本地验证码 OCR 工作线程与提示音',
     });
-  }
+  })().finally(() => { offscreenCreating = null; });
+  return offscreenCreating;
+}
+async function playSound(times) {
+  await ensureOffscreen();
   chrome.runtime.sendMessage({ type: 'play-sound', times }).catch(() => {});
 }
 
@@ -430,9 +435,23 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // ---------------- 消息接口 ----------------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.target === 'ocr-offscreen' || msg?.type === 'play-sound') return false;
   (async () => {
     try {
       switch (msg?.type) {
+        case 'OCR_PROGRESS': {
+          if (sender.url !== chrome.runtime.getURL('offscreen/sound.html') || !Number.isInteger(msg.tabId)) break;
+          await chrome.tabs.sendMessage(msg.tabId, { type: 'OCR_PROGRESS', requestId: msg.requestId, stage: msg.stage }).catch(() => {});
+          sendResponse({ ok: true });
+          break;
+        }
+        case 'OCR_CAPTCHA': {
+          if (!/^https:\/\/tickets\.interpark\.com\/onestop/.test(sender.tab?.url || '')) throw new Error('OCR 仅用于选座页');
+          if (typeof msg.image !== 'string' || !/^data:image\/(jpeg|png|webp);base64,/.test(msg.image) || msg.image.length > 2000000) throw new Error('验证码图片格式错误');
+          await ensureOffscreen();
+          sendResponse(await chrome.runtime.sendMessage({ target: 'ocr-offscreen', image: msg.image, tabId: sender.tab.id, requestId: msg.requestId }));
+          break;
+        }
         case 'get-state': {
           await ensureTimeSynced();
           const running = [...tasks.values()].find((t) => t.mode === 'seat' && t.status === 'running');

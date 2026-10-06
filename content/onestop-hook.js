@@ -12,8 +12,10 @@
   // 验证码两步也旁听：image = 关卡出现，verify = 交答案（只用来判"通过没通过"）
   const WATCH = ['/onestop/api/seatStatus', '/onestop/api/seatMeta', '/onestop/api/seats/block-data',
     '/onestop/api/seats/grades', '/onestop/gql', '/onestop/api/play/play-date',
-    '/onestop/api/captcha/image', '/onestop/api/captcha/verify'];
+    '/onestop/api/seats/select', '/onestop/api/captcha/image', '/onestop/api/captcha/verify'];
 
+  const seatIds = body => { try { return JSON.parse(body)?.seats?.map(s => s.seatInfoId) || []; } catch (e) { return []; } };
+  const safeUrl = url => String(url).replace(/([?&]p1=)[^&]*/gi, '$1***');
   const post = (type, payload) => {
     try { window.postMessage({ __tag: TAG, type, payload }, location.origin); } catch (e) { /* noop */ }
   };
@@ -57,7 +59,7 @@
       return p.then((res) => {
         try {
           res.clone().text().then((text) => {
-            post('api', { url, status: res.status, text: text.slice(0, 4_000_000) });
+            post('api', { url: safeUrl(url), requestSeatIds: url.includes('/seats/select') ? seatIds(init?.body) : undefined, status: res.status, text: text.slice(0, 4_000_000) });
           }).catch(() => {});
         } catch (e) { /* noop */ }
         return res;
@@ -83,14 +85,15 @@
       }
       return setHeader.apply(this, arguments);
     };
-    XHR.prototype.send = function () {
+    XHR.prototype.send = function (body) {
+      const requestSeatIds = String(this.__nsUrl).includes('/seats/select') ? seatIds(body) : undefined;
       if (looksWatched(this.__nsUrl)) {
         this.addEventListener('load', () => {
           try {
             let text = '';
             if (this.responseType === '' || this.responseType === 'text') text = this.responseText || '';
             else if (this.responseType === 'json') text = JSON.stringify(this.response || null);
-            post('api', { url: this.__nsUrl, status: this.status, text: String(text).slice(0, 4_000_000) });
+            post('api', { url: safeUrl(this.__nsUrl), requestSeatIds, status: this.status, text: String(text).slice(0, 4_000_000) });
           } catch (e) { /* noop */ }
         });
       }

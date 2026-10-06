@@ -24,6 +24,8 @@ const PARTS = [
   'lib/session-timer.js',
   'lib/panel-pos.js',
   'lib/captcha.js',
+  'lib/automation.js',
+  'lib/captcha-dom.js',
   'content/onestop-seat.js',
 ];
 

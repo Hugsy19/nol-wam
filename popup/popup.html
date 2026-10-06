@@ -89,6 +89,8 @@
       <label class="check"><input id="sSound" type="checkbox" /> 提示音 <button id="sTest" class="btn ghost tiny">试听</button></label>
       <label class="check"><input id="sAutoOpen" type="checkbox" /> 命中后自动切换到座位页</label>
       <label class="check"><input id="sAutoSeatTab" type="checkbox" /> 启动座位任务时自动打开入场链接</label>
+      <label class="check"><input id="sAutoCaptcha" type="checkbox" /> 自动填写文字验证码并验证（本地识别）</label>
+      <label class="check"><input id="sAutoLock" type="checkbox" /> 找到最优座位后自动预选并锁票</label>
       <label>全局最小扫描间隔 (ms)
         <input id="sMinInterval" type="number" min="300" step="100" />
       </label>
@@ -97,7 +99,7 @@
   </section>
 
   <footer class="foot">
-    仅监控与提醒，不自动选座下单 · 请遵守 NOL 条款与当地法律
+    自动验证码与自动锁票可在设置中开启 · 锁票成功后请完成后续购票
   </footer>
 
   <script src="popup.js"></script>

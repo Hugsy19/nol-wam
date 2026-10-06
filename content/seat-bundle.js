@@ -1,6 +1,6 @@
 // ⚠️ 本文件由 tools/build.mjs 自动生成，请勿直接修改。
-// 源文件：lib/nol-api.js + lib/seat-engine.js + lib/locator.js + lib/seat-prefs.js + lib/session-timer.js + lib/panel-pos.js + lib/captcha.js + content/onestop-seat.js
-// 生成时间：2026-10-06T09:56:18.891Z
+// 源文件：lib/nol-api.js + lib/seat-engine.js + lib/locator.js + lib/seat-prefs.js + lib/session-timer.js + lib/panel-pos.js + lib/captcha.js + lib/automation.js + lib/captcha-dom.js + content/onestop-seat.js
+// 生成时间：2026-10-06T14:29:41.117Z
 (() => {
 'use strict';
 // ===== lib/nol-api.js =====
@@ -974,6 +974,8 @@ const DEFAULT_SCOUT_PREFS = {
   // 用户明确要过"由我点开始"，所以不擅自开；打开后，检测到验证码关卡且目录就绪时会自动开扫，
   // 让输入验证码的那 ~8 秒不空转（实测这段耗时 8.3s，会从选座 10 分钟里扣）。
   captchaAutoStart: false,
+  captchaAutoSolve: false,
+  autoLock: false,
 };
 
 // 轮询下限 800ms：捡漏就吃这一口"比别人快半个身位"。
@@ -1009,6 +1011,8 @@ function normalizePrefs(input = {}) {
     stageSide: STAGE_SIDES.includes(src.stageSide) ? src.stageSide : DEFAULT_SCOUT_PREFS.stageSide,
     intervalMs: clampInt(src.intervalMs, MIN_INTERVAL_MS, MAX_INTERVAL_MS, DEFAULT_SCOUT_PREFS.intervalMs),
     captchaAutoStart: src.captchaAutoStart === true,
+    captchaAutoSolve: src.captchaAutoSolve === true,
+    autoLock: src.autoLock === true,
   };
 }
 
@@ -1413,15 +1417,7 @@ function normalizePanelPos(raw) {
 //   GET  /onestop/api/captcha/verify?p1=<答案>&…&p9=<签名> → {"result":"Y"} t+87.7s
 //   → 人工看图 + 输入 + 提交 ≈ **8.3 秒**，且全部落在选座 10 分钟窗口内（占 1.4%）。
 //
-// 模块边界（重要，改动前必读）：
-//   只做「发现关卡 / 计时 / 把光标送进输入框」。
-//   **不做**：不请求 captcha/image、不读图、不做 OCR、不代填、不调 captcha/verify。
-//   理由：这是站点的反机器人闸门（本场还带了滑块变体 captchaPlugin），
-//   而 verify 还挂着 p9 签名 —— 要复用签名就得把整条购买链路一起重放，
-//   那正是《공연법》14③ 与 NOL「检测到 macro 即取消订单并封号」所指的行为。
-//   拿 8 秒（600 秒的 1.4%）去换这个风险，收益与代价完全不成比例。
-//
-// 本文件只放纯函数，方便 test/verify-har.mjs 直接断言。
+// 关卡计时与结果解析；本地识别和自动提交见 offscreen/ocr.js 与 onestop-seat.js。
 
 const CAPTCHA_API = {
   image: '/onestop/api/captcha/image',
@@ -1547,6 +1543,68 @@ function gateAdvice({ monitoring, autoStartEnabled, ready }) {
 }
 
 
+// ===== lib/automation.js =====
+// 自动操作的纯函数。请求只使用当前页面会话，不复用 HAR 的令牌或签名。
+function normalizeOcrAnswer(text) {
+  const answer = String(text || '').replace(/\s/g, '').toUpperCase();
+  return /^[A-Z]{6}$/.test(answer) ? answer : '';
+}
+
+function makeLockPayload(page, run, quantity) {
+  if (!page.session || !page.goodsCode || !page.placeCode || !page.playSeq) throw new Error('缺少当前购票会话');
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 8) throw new Error('购票数量错误');
+  const seats = run?.seats?.slice(0, quantity) || [];
+  if (seats.length !== quantity || new Set(seats.map(s => s.id)).size !== quantity) throw new Error('候选座位不足或重复');
+  const prefix = `${page.goodsCode}:${page.placeCode}:${page.playSeq}:`;
+  if (seats.some(s => !s.id?.startsWith(prefix) || !s.grade)) throw new Error('座位与当前场次不匹配');
+  return {
+    goodsCode: page.goodsCode, placeCode: page.placeCode, playSeq: page.playSeq,
+    seatType: 'DEFAULT', seats: seats.map(s => ({ seatGrade: s.grade, seatInfoId: s.id })),
+    sessionId: page.session, autoAssign: false,
+  };
+}
+
+function lockOutcome(json) {
+  if (!Array.isArray(json?.unselectableSeatInfoIds)) return 'unknown';
+  return json.unselectableSeatInfoIds.length === 0 ? 'locked' : 'unavailable';
+}
+
+
+// ===== lib/captcha-dom.js =====
+// 验证码图片、输入框和 footer 位于同一弹窗的不同层级。
+function captchaDomStatus(doc) {
+  const input = doc.querySelector('input[class*="captchaInput"], [class*="captchaInput"] input');
+  if (!input) return { reason: '等待验证码输入框渲染' };
+  let image;
+  for (let root = input.parentElement; root && root !== doc.body; root = root.parentElement) {
+    image = root.querySelector('[class*="captchaImage"] img') || image;
+    const button = root.querySelector('footer button, [class*="footer"] button');
+    if (image && button) return { root, input, image, button, reason: '' };
+  }
+  return { input, reason: image ? '等待验证码确认按钮渲染' : '等待验证码图片渲染' };
+}
+function findCaptchaControls(doc) {
+  const status = captchaDomStatus(doc);
+  return status.reason ? null : status;
+}
+
+// 节流保证连续 DOM 更新不能无限推迟检查；属性监听和轮询覆盖分阶段渲染。
+function watchCaptchaDom(doc, check, shouldPoll) {
+  let timer;
+  const observer = new MutationObserver(() => {
+    if (timer) return;
+    timer = setTimeout(() => { timer = null; check(); }, 100);
+  });
+  observer.observe(doc.documentElement, {
+    childList: true, subtree: true, attributes: true,
+    attributeFilter: ['src', 'class', 'disabled'],
+  });
+  const poll = setInterval(() => { if (shouldPoll()) check(); }, 500);
+  check();
+  return () => { observer.disconnect(); clearTimeout(timer); clearInterval(poll); };
+}
+
+
 // ===== content/onestop-seat.js =====
 // NOL Scout — 座位页监控脚本（ISOLATED world，v0.4）
 // 运行在 https://tickets.interpark.com/onestop/seat 上。
@@ -1557,8 +1615,7 @@ function gateAdvice({ monitoring, autoStartEnabled, ready }) {
 //   3) 命中时：通知 + 提示音 + 弹出精确座位（区域/排/号/价位）+ 在座位图上高亮
 //   4) 把命中的座位**画到页面自己的座位图上**（叠加标记 + 自动滚动居中）
 //
-// 边界：全程只读，不点选座位、不调用 seats/select、不提交订单、不识别验证码。
-//       命中后由你自己在页面上点击那个被标出来的座位。
+// 可选本地验证码识别与自动锁票；不自动提交支付。
 
 
 
@@ -1575,6 +1632,7 @@ const state = {
   catalog: null, catalogKey: '',
   status: {}, prevStatus: {}, lastSeenAt: {},
   monitor: null,
+  automation: { busy: false, locked: null, uncertain: false, lastAttempt: 0, captchaImage: null, captchaGeneration: 0, ocrBusy: false, ocrTried: new Set() },
   panel: null, modal: null,
   panelPos: null,      // {left, top} 面板落点；null = 用默认的贴左位置
   logLines: [],
@@ -1626,6 +1684,11 @@ function onSession(p) {
   if (p.session && p.session !== state.session) {
     state.session = p.session;
     isNew = true;
+    state.automation.locked = null;
+    state.automation.uncertain = false;
+    state.captcha.passed = null;
+    state.automation.captchaGeneration++;
+    state.automation.ocrTried.clear();
     log(`已捕获会话 ${state.session.slice(0, 30)}…`);
     syncTimerToken(p.session);
   }
@@ -1843,7 +1906,7 @@ function notifySoon(title, message) {
 // ---------------- 验证码关卡（合规版） ----------------
 //
 // 只做三件事：**发现关卡 / 把光标送进输入框 / 把这段时间花在哪摆到你面前**。
-// 不读图、不识别、不代填、不代提交、不碰 captcha/verify（理由见 lib/captcha.js）。
+// 计时与聚焦始终可用；启用本地识别时由页面原有按钮验证。
 //
 // 为什么值得做：实测这一关卡要吃掉约 8.3 秒，而这 8.3 秒是从选座 10 分钟里扣的。
 // 既然不能替你输入，就至少让你不用再去找时间、找输入框。
@@ -1862,6 +1925,8 @@ function captchaAppear(source, kind) {
   // 才重新武装，否则观察器会把同一张图反复判成"新的验证码关卡"，徽标也跟着阴魂不散。
   if (c.needGone) return;
   c.active = true;
+  c.inputReadyNoted = false;
+  state.automation.captchaNote = '';
   c.seenAt = Date.now();
   c.passed = null;
   c.stuckWarned = false;
@@ -2076,6 +2141,7 @@ function captchaFinish(ok, why) {
       c.totalMs >= 12000 ? 'warn' : 'hit');
     // 只把「这一关总共花了多久」记下来；答案本身从来不碰
     noteCaptchaCost(c.totalMs, c.attempts, c.kind);
+    if (state.monitor) maybeEvaluate('captcha-passed');
   } else {
     log(`🔎 验证码框已消失，但没读到服务端结果（本轮 ${formatElapsed(ms)}）`, 'warn');
   }
@@ -2108,7 +2174,7 @@ function captchaMaybeGone() {
  * 用 MutationObserver + 250ms 尾部去抖：模态是插入/移除的，轮询会慢半拍，
  * 但每次 DOM 变动都跑一次 querySelector 又太贵。
  */
-let captchaMoDom = null, captchaMoTimer = null;
+let captchaMoDom = null;
 function captchaWatchStart() {
   if (captchaMoDom) return;
   const target = document.documentElement;
@@ -2120,6 +2186,12 @@ function captchaWatchStart() {
       if (C().needGone) return;      // 通关后同一张图还没移走，别把旧关卡当新的
       const kind = captchaKindFromClass(box.className || box.parentElement?.className || '');
       captchaAppear('dom', kind);
+      if (!C().inputReadyNoted && document.querySelector('input[class*="captchaInput"], [class*="captchaInput"] input')) {
+        C().inputReadyNoted = true;
+        focusCaptchaInput();
+        log('验证码输入框已就绪' + (state.prefs.captchaAutoSolve ? '，准备自动填写' : '；自动填写未开启，请在插件设置中开启或手动输入'));
+      }
+      maybeSolveCaptcha();
       if (C().badge) positionCaptchaBadge();
     } else {
       // 框真的消失了 → 重新武装，下一次出现的才是新关卡
@@ -2127,12 +2199,8 @@ function captchaWatchStart() {
       captchaMaybeGone();
     }
   };
-  captchaMoDom = new MutationObserver(() => {
-    clearTimeout(captchaMoTimer);
-    captchaMoTimer = setTimeout(check, 250);
-  });
-  captchaMoDom.observe(target, { childList: true, subtree: true });
-  check();   // 页面可能已经停在验证码上了（刷新后直接命中）
+  captchaMoDom = watchCaptchaDom(document, check, () => C().active || C().needGone);
+
 }
 
 /**
@@ -2171,8 +2239,16 @@ function scheduleCatalogBuild() {
 }
 
 // 旁听页面自己的请求：拿上下文 + 顺带把页面拉的余票/座位数据收进来
-function onPassiveApi({ url, status, text }) {
+function onPassiveApi({ url, status, text, requestSeatIds }) {
   if (!url) return;
+  if (url.includes('/onestop/api/seats/select')) {
+    let outcome = 'unknown';
+    try { if (status >= 200 && status < 300) outcome = lockOutcome(JSON.parse(text)); } catch (e) { /* unknown */ }
+    state.automation.lockReceipt = { ids: requestSeatIds || [], outcome, at: Date.now() };
+  }
+  if (url.includes('/onestop/gql')) {
+    try { const init = JSON.parse(text)?.data?.initSeat; if (init) state.ticketMaxCount = Number(init.ticketMaxCount) || 0; } catch (e) { /* noop */ }
+  }
   const q = parseQuery(url);
   if (q.playSeq) state.playSeq = q.playSeq;
   if (q.goodsCode) state.goodsCode = q.goodsCode;
@@ -2199,6 +2275,16 @@ function onPassiveApi({ url, status, text }) {
   const capStage = captchaStage(url);
   if (capStage === 'image') {
     captchaAppear('hook', '');
+    try {
+      const image = JSON.parse(text)?.Img;
+      if (typeof image === 'string' && image.startsWith('data:image/')) {
+        if (state.automation.captchaImage !== image) {
+          state.automation.captchaImage = image;
+          state.automation.captchaGeneration++;
+        }
+        maybeSolveCaptcha();
+      }
+    } catch (e) { /* wait for next image */ }
   } else if (capStage === 'verify') {
     const ok = captchaPassed(text);
     if (ok === true) captchaFinish(true);
@@ -2255,6 +2341,7 @@ async function loadPrefs() {
 
 async function savePrefs(patch) {
   state.prefs = normalizePrefs({ ...state.prefs, ...patch });
+  if (patch.autoLock === false) pageCommand('cancel').catch(() => {});
   // 不能读写同一个对象：normalizePrefs 返回新对象，但 grades/regions 是数组，浅拷贝即可
   await chrome.storage.local.set({ [PREFS_KEY]: state.prefs }).catch(() => {});
   return state.prefs;
@@ -2273,6 +2360,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
   // 自己刚写进去的那份已经在本地重绘过了；这里再去重绘一次等于把整张地图画两遍。
   if (JSON.stringify(next) === JSON.stringify(state.prefs)) return;
   state.prefs = next;
+  if (!next.autoLock) pageCommand('cancel').catch(() => {});
+  renderPanel();
+  maybeSolveCaptcha();
+  if (state.monitor) maybeEvaluate('settings-changed');
   if (state.panel?.root) syncScopeUI(state.panel.root);
   else renderPanel();
 });
@@ -2406,6 +2497,7 @@ async function startMonitor(task) {
 function stopMonitor({ quiet = false } = {}) {
   if (!state.monitor) return;
   state.monitor.ctrl.abort();
+  if (state.automation.busy) pageCommand('cancel').catch(() => {});
   state.monitor = null;
   clearOverlay();
   renderPanel();
@@ -2455,6 +2547,8 @@ async function maybeEvaluate(trigger) {
     const m = state.monitor;
     const res = matchSnapshot(m.task, state.catalog, state.status, state.prevStatus);
     m.lastResult = res;
+    if (res.hit && res.best) await maybeLockBest(res.best, m);
+    if (state.monitor !== m) return;
     if (res.hit && res.best) {
       const now = Date.now();
       if (now - (m.lastHitAt || 0) > (m.task.cooldownMs || 15000)) {
@@ -2485,6 +2579,135 @@ async function maybeEvaluate(trigger) {
   } finally {
     evaluating = false;
   }
+}
+
+// ---------------- 本地文字验证码与自动锁票 ----------------
+function captchaAutoNote(reason) {
+  if (state.automation.captchaNote === reason) return;
+  state.automation.captchaNote = reason;
+  log(reason, 'warn');
+}
+async function maybeSolveCaptcha() {
+  const a = state.automation;
+  if (!C().active || a.ocrBusy || timerSnapshot().state === 'dead') return;
+  if (!state.prefs.captchaAutoSolve) { captchaAutoNote('自动填写验证码已关闭；请在插件设置中勾选并保存'); return; }
+  if (C().kind === 'slider') { captchaAutoNote('当前为滑块验证码，请手动完成'); return; }
+  const controls = captchaDomStatus(document);
+  if (controls.reason) { captchaAutoNote(controls.reason); return; }
+  const { input, button } = controls;
+  const image = controls.image.src || a.captchaImage;
+  // 确认按钮在输入六位前本来就是 disabled，不能在填写前因此退出。
+  if (!image?.startsWith('data:image/')) { captchaAutoNote('等待验证码图片地址就绪'); return; }
+  if (input.value) return;
+  const generation = a.captchaGeneration;
+  if (a.ocrTried.has(image)) return;
+  a.ocrTried.add(image);
+  a.ocrBusy = true;
+  const session = state.session;
+  a.ocrRequestId = crypto.randomUUID();
+  log('正在本地识别文字验证码…');
+  let ocrTimeout;
+  try {
+    const result = await Promise.race([
+      chrome.runtime.sendMessage({ type: 'OCR_CAPTCHA', image, requestId: a.ocrRequestId }),
+      new Promise((_, reject) => { ocrTimeout = setTimeout(() => reject(new Error('本地识别等待超过 15 秒，请手动输入')), 15000); }),
+    ]);
+    clearTimeout(ocrTimeout);
+    if (!state.prefs.captchaAutoSolve || !C().active || timerSnapshot().state === 'dead') return;
+    // 页面先渲染、钩子后读完同一张图时 generation 可能改变；只丢弃实际图片/会话已经变更的结果。
+    if (session !== state.session || !input.isConnected || controls.image.src !== image) {
+      log('本地识别已返回，但验证码图片或会话已更新，等待当前图片', 'warn');
+      a.ocrTried.delete(image);
+      return;
+    }
+    if (input.value) { log('本地识别已返回，输入框已有内容，保留你的输入'); return; }
+    log(`本地识别已完成（置信度 ${Math.round(result?.confidence || 0)}）`);
+    const answer = normalizeOcrAnswer(result?.text);
+    if (!answer || !(result.confidence >= 40)) throw new Error(result?.error || '识别置信度不足，请手动输入');
+    // React 受控输入：原生 setter + input 事件，让页面更新答案并生成验证签名。
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, answer);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    for (let i = 0; i < 20 && button.disabled; i++) await sleep(50);
+    if (!state.prefs.captchaAutoSolve || !C().active || !button.isConnected || session !== state.session || controls.image.src !== image || input.value !== answer) return;
+    if (button.disabled) { log('验证码已填写，但页面确认按钮仍未启用，请检查页面提示', 'warn'); return; }
+    button.click();
+    log('已提交本地识别结果，等待页面验证');
+  } catch (e) { log(e.message, 'warn'); }
+  finally {
+    clearTimeout(ocrTimeout);
+    a.ocrBusy = false;
+    if (a.captchaGeneration !== generation && state.prefs.captchaAutoSolve) setTimeout(maybeSolveCaptcha, 0);
+  }
+}
+
+const pagePending = new Map();
+window.addEventListener('message', ev => {
+  const d = ev.data;
+  if (ev.source !== window || ev.origin !== location.origin || d?.__tag !== 'nol-scout-page' || d.type !== 'result') return;
+  const pending = pagePending.get(d.id);
+  if (!pending) return;
+  pagePending.delete(d.id); clearTimeout(pending.timer); pending.resolve(d.payload);
+});
+function pageCommand(action, payload = {}) {
+  return new Promise((resolve, reject) => {
+    const id = crypto.randomUUID();
+    const timer = setTimeout(() => { pagePending.delete(id); reject(new Error('页面操作超时')); }, action === 'lock' ? 45000 : 3000);
+    pagePending.set(id, { resolve, timer });
+    window.postMessage({ __tag: 'nol-scout-page', type: 'command', id, action, payload }, location.origin);
+  });
+}
+
+async function maybeLockBest(run, monitor) {
+  const a = state.automation;
+  if (!state.prefs.autoLock || a.busy || a.locked || a.uncertain || timerSnapshot().state === 'dead' || Date.now() - a.lastAttempt < 3000) return;
+  const session = state.session;
+  const scene = [state.goodsCode, state.placeCode, state.playSeq].join('|');
+  a.busy = true;
+  a.lastAttempt = Date.now();
+  let sent = false;
+  try {
+    const status = await pageCommand('status');
+    if (!status.verified || status.session !== session) return;
+    if (document.querySelector(CAPTCHA_SEL.box)) return;
+    if (status.selectedIds?.length) throw new Error('页面已有选中座位，请先人工确认');
+    C().passed = true;
+    const quantity = monitor.task.quantity || 1;
+    if (state.ticketMaxCount && quantity > state.ticketMaxCount) throw new Error(`本场最多可选 ${state.ticketMaxCount} 张`);
+    const payload = makeLockPayload(state, run, quantity);
+    const fresh = await getSeatStatus(state, [run.blockKey], ctx(), { signal: monitor.ctrl.signal });
+    const block = state.catalog.blocks.find(b => b.key === run.blockKey);
+    const flags = decodeBlockStatus(fresh[run.blockKey], block?.seats.length || 0);
+    if (payload.seats.some(s => !flags[block?.seats.findIndex(x => x.id === s.seatInfoId)])) return;
+    // 取原始元数据，保留 seatGroupId / floor 等页面原生校验需要的字段。
+    const meta = await getSeatMeta(state, [run.blockKey], ctx(), { signal: monitor.ctrl.signal });
+    const originals = meta.flatMap(b => b.seats || []);
+    const seats = payload.seats.map(target => originals.find(s => s.seatInfoId === target.seatInfoId));
+    if (seats.some(s => !s)) throw new Error('座位元数据不完整');
+    if (state.monitor !== monitor || monitor.ctrl.signal.aborted || !state.prefs.autoLock || session !== state.session || scene !== [state.goodsCode, state.placeCode, state.playSeq].join('|') || timerSnapshot().state === 'dead') return;
+    log(`正在通过页面预选并锁票：${hitSummary(run)}`);
+    a.lockReceipt = null;
+    sent = true;
+    const result = await pageCommand('lock', { session, goodsCode: state.goodsCode, placeCode: state.placeCode, playSeq: state.playSeq, blockKey: run.blockKey, seats });
+    // 原生回调进入 price + 实际锁票响应，两者同时成立才算完成。
+    await sleep(100);
+    const receipt = a.lockReceipt;
+    const ids = payload.seats.map(s => s.seatInfoId).sort();
+    const receiptMatches = receipt?.ids?.length === ids.length && [...receipt.ids].sort().every((id, i) => id === ids[i]);
+    if (result.outcome === 'locked' && receiptMatches && receipt.outcome === 'locked') {
+      const selected = { ...run, seats: run.seats.slice(0, quantity), seatNos: run.seatNos.slice(0, quantity), len: quantity };
+      a.locked = { seats: payload.seats, summary: hitSummary(selected), at: Date.now() };
+      log(`✅ 锁票成功，已进入票价步骤：${a.locked.summary}`, 'hit');
+      notifySoon('锁票成功', a.locked.summary);
+      stopMonitor();
+    } else {
+      a.uncertain = result.uncertain !== false;
+      log(result.error || '尚未同时确认服务器锁票结果和页面跳转，请检查页面', 'warn');
+    }
+  } catch (e) {
+    if (sent) a.uncertain = true;
+    if (!monitor.ctrl.signal.aborted || sent) log(sent ? '页面锁票结果未确认，自动操作暂停，请检查页面' : `锁票前检查失败：${e.message}`, 'warn');
+  } finally { a.busy = false; renderPanel(); }
 }
 
 // ---------------- 页面座位图定位 ----------------
@@ -3110,6 +3333,9 @@ function renderPanel() {
     ${!cap.active && cap.lastCost ? `<div class="row"><span class="k">上次验证码</span><span class="v">⏱ ${formatElapsed(cap.lastCost.totalMs)}${cap.lastCost.attempts > 1 ? ` · ${cap.lastCost.attempts} 次` : ''}</span></div>` : ''}
     ${res ? `<div class="row"><span class="k">全场合计</span><span class="v ${res.freeSeats ? 'hit' : ''}">${res.freeSeats} 座 · ${res.blocksWithFree} 区块</span></div>` : ''}
     <div class="bar"><button class="btn ${m ? 'stop' : 'go'}" id="btnScan">${m ? '■ 停止扫描' : '▶ 开始捡漏扫描'}</button></div>
+    <div class="bar"><button class="btn" id="btnAutoCaptcha">自动验证码：${state.prefs.captchaAutoSolve ? '开' : '关'}</button><button class="btn" id="btnAutoLock">自动锁票：${state.prefs.autoLock ? '开' : '关'}</button></div>
+    ${state.automation.locked ? `<div class="banner ready">已锁票：${esc(state.automation.locked.summary)}。已进入网站票价步骤，请继续购票。</div>` : ''}
+    ${state.automation.uncertain ? '<div class="banner cap">锁票状态待人工确认，自动锁票已暂停。请检查页面后再开启。</div>' : ''}
     <div class="row"><span class="k">扫描范围</span><span class="v" id="scopeSummary">${esc(describePrefs(state.prefs, { nameOfGrade: gradeNameMap() }))}</span></div>
     <div class="bar"><button class="btn" id="btnScope">${state.ui.scopeOpen ? '▾ 收起筛选' : '▸ 调整范围'}</button></div>
     <div class="scope-box ${state.ui.scopeOpen ? '' : 'hide'}" id="scopeBox">${renderScope()}</div>
@@ -3123,7 +3349,7 @@ function renderPanel() {
       <div class="bar">
         <button class="btn" data-act="fullmap" title="打开全屏座位图（Esc 关闭）：绿=可购、灰=已售、黄圈=命中、蓝框=当前筛选选中的区块。">⛶ 全屏座位图</button>
       </div>
-      <div class="hintbar">命中后按候选顺序（首选 / 备份1 / 备份2）挑一个，点「定位」跳过去，座位由你在页面上亲自点选。</div>
+      <div class="hintbar">自动锁票开启后会提交首选座位；关闭时可按候选顺序定位。锁票成功后请确认座位并完成后续购票。</div>
     </div>
     <div class="logs">${state.logLines.slice(-40).reverse().map((l) =>
       `<div><span class="hit">${new Date(l.t).toLocaleTimeString('zh-CN', { hour12: false })}</span> <span class="${l.level}">${esc(l.msg)}</span></div>`).join('')}</div>`;
@@ -3265,7 +3491,7 @@ function mapLegendHtml() {
 }
 
 // 候选优先级队列：把 matchSnapshot 排好序的可用连座段切成「首选 / 备份1 / 备份2」。
-// 队列只做排序 + 定位 + 复制 —— 页面上的选座点击始终由用户完成。
+// 队列显示排序、定位、复制；开启自动锁票时提交首选。
 function renderQueue(res) {
   const items = labelRuns(res.runs, 3);
   if (!items.length) return '';
@@ -3296,6 +3522,15 @@ function copyRun(run) {
 }
 
 function bind(root) {
+  const ac = root.getElementById('btnAutoCaptcha');
+  if (ac) ac.onclick = async () => { await savePrefs({ captchaAutoSolve: !state.prefs.captchaAutoSolve }); renderPanel(); maybeSolveCaptcha(); };
+  const al = root.getElementById('btnAutoLock');
+  if (al) al.onclick = async () => {
+    await savePrefs({ autoLock: !state.prefs.autoLock });
+    if (state.prefs.autoLock) state.automation.uncertain = false;
+    renderPanel();
+    if (state.monitor) maybeEvaluate('auto-lock-toggle');
+  };
   const scan = root.getElementById('btnScan');
   if (scan) scan.onclick = async () => {
     if (state.monitor) return stopMonitor();
@@ -3593,6 +3828,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       switch (msg?.type) {
+        case 'OCR_PROGRESS':
+          if (state.automation.ocrBusy && msg.requestId === state.automation.ocrRequestId) log(msg.stage);
+          sendResponse({ ok: true });
+          break;
         case 'SEAT_HELLO':
         case 'GET_SEAT_STATE':
           sendResponse({ ok: true, ...publicState() });

@@ -20,6 +20,7 @@ const stateRef = {
   scopeOpen: false,
   scoutSig: '',
   busy: false,
+  settingsDirty: false,
 };
 const selectedGrades2 = new Set();
 
@@ -77,6 +78,8 @@ function normalizePrefs(input = {}) {
     // 这个开关只在页面面板里真正生效，但 popup 保存参数时必须原样带回去，
     // 否则用户在 popup 里点任意一个 chip 都会把它悄悄重置成关闭。
     captchaAutoStart: src.captchaAutoStart === true,
+    captchaAutoSolve: src.captchaAutoSolve === true,
+    autoLock: src.autoLock === true,
   };
 }
 
@@ -97,6 +100,7 @@ function bindUI() {
     await chrome.runtime.sendMessage({ type: 'test-sound' });
   };
   $('#sSave').onclick = saveSettings;
+  $('#settings').addEventListener('change', () => { stateRef.settingsDirty = true; });
 }
 
 function toggle(panelSel, caretSel) {
@@ -396,6 +400,13 @@ async function createPageTask() {
 }
 
 async function saveSettings() {
+  const { scoutPrefs = {} } = await chrome.storage.local.get('scoutPrefs');
+  const prefs = normalizePrefs({ ...scoutPrefs, captchaAutoSolve: $('#sAutoCaptcha').checked, autoLock: $('#sAutoLock').checked });
+  stateRef.busy = true;
+  try {
+    await chrome.storage.local.set({ scoutPrefs: prefs });
+    stateRef.prefs = prefs;
+  } finally { stateRef.busy = false; };
   const res = await chrome.runtime.sendMessage({
     type: 'update-settings',
     settings: {
@@ -407,6 +418,7 @@ async function saveSettings() {
     },
   });
   if (res?.ok) {
+    stateRef.settingsDirty = false;
     $('#sSave').textContent = '已保存 ✓';
     setTimeout(() => ($('#sSave').textContent = '保存设置'), 1200);
   }
@@ -464,12 +476,14 @@ function renderSeatStatus(d) {
 }
 
 function fillSettings(s) {
-  if (!s) return;
+  if (!s || stateRef.settingsDirty) return;
   $('#sNotify').checked = !!s.notify;
   $('#sSound').checked = !!s.sound;
   $('#sAutoOpen').checked = !!s.autoOpenTab;
   $('#sAutoSeatTab').checked = !!s.autoEnsureSeatTab;
   $('#sMinInterval').value = s.minIntervalMs;
+  $('#sAutoCaptcha').checked = !!stateRef.prefs.captchaAutoSolve;
+  $('#sAutoLock').checked = !!stateRef.prefs.autoLock;
 }
 
 function applyCatalogToChips(catalog) {
