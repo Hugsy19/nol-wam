@@ -97,8 +97,9 @@ function bindUI() {
   $('#fCreate').onclick = createPageTask;
   $('#sTest').onclick = async (e) => {
     e.preventDefault();
-    await chrome.runtime.sendMessage({ type: 'test-sound' });
+    await chrome.runtime.sendMessage({ type: 'test-sound', options: { soundStyle: $('#sSoundStyle').value, soundVolume: Number($('#sSoundVolume').value) } });
   };
+  $('#sStopSound').onclick = () => chrome.runtime.sendMessage({ type: 'stop-sound' });
   $('#sSave').onclick = saveSettings;
   $('#settings').addEventListener('change', () => { stateRef.settingsDirty = true; });
 }
@@ -412,6 +413,8 @@ async function saveSettings() {
     settings: {
       notify: $('#sNotify').checked,
       sound: $('#sSound').checked,
+      soundStyle: $('#sSoundStyle').value,
+      soundVolume: Math.max(0, Math.min(100, Number($('#sSoundVolume').value) || 0)),
       autoOpenTab: $('#sAutoOpen').checked,
       autoEnsureSeatTab: $('#sAutoSeatTab').checked,
       minIntervalMs: Number($('#sMinInterval').value) || 600,
@@ -479,6 +482,8 @@ function fillSettings(s) {
   if (!s || stateRef.settingsDirty) return;
   $('#sNotify').checked = !!s.notify;
   $('#sSound').checked = !!s.sound;
+  $('#sSoundStyle').value = s.soundStyle === 'classic' ? 'classic' : 'alarm';
+  $('#sSoundVolume').value = s.soundVolume ?? 80;
   $('#sAutoOpen').checked = !!s.autoOpenTab;
   $('#sAutoSeatTab').checked = !!s.autoEnsureSeatTab;
   $('#sMinInterval').value = s.minIntervalMs;

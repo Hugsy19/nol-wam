@@ -12,6 +12,8 @@ import { syncTime, ensureTimeSynced, serverNow, timeSyncInfo } from '../lib/time
 const DEFAULT_SETTINGS = {
   notify: true,
   sound: true,
+  soundStyle: 'alarm',
+  soundVolume: 80,
   autoOpenTab: true,
   autoEnsureSeatTab: true, // 启动座位任务时自动把 onestop 页面拉起来
   minIntervalMs: 600,
@@ -383,9 +385,9 @@ async function ensureOffscreen() {
   })().finally(() => { offscreenCreating = null; });
   return offscreenCreating;
 }
-async function playSound(times) {
+async function playSound(times, options = settings) {
   await ensureOffscreen();
-  chrome.runtime.sendMessage({ type: 'play-sound', times }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'play-sound', times, style: options.soundStyle, volume: options.soundVolume }).catch(() => {});
 }
 
 // ---------------- 看门狗 ----------------
@@ -435,7 +437,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // ---------------- 消息接口 ----------------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.target === 'ocr-offscreen' || msg?.type === 'play-sound') return false;
+  if (msg?.target === 'ocr-offscreen' || (msg?.type === 'play-sound' || msg?.target === 'sound-offscreen')) return false;
   (async () => {
     try {
       switch (msg?.type) {
@@ -520,7 +522,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, settings });
           break;
         case 'test-sound':
-          await playSound(1);
+          await playSound(1, { ...settings, ...msg.options });
+          sendResponse({ ok: true });
+          break;
+        case 'stop-sound':
+          await ensureOffscreen();
+          await chrome.runtime.sendMessage({ type: 'stop-sound', target: 'sound-offscreen' }).catch(() => {});
           sendResponse({ ok: true });
           break;
         case 'sync-time': {

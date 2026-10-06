@@ -86,7 +86,9 @@
     <div class="panel-head" id="setToggle"><span>⚙ 设置</span><span class="caret" id="setCaret">▾</span></div>
     <div class="form hidden" id="settings">
       <label class="check"><input id="sNotify" type="checkbox" /> 浏览器通知</label>
-      <label class="check"><input id="sSound" type="checkbox" /> 提示音 <button id="sTest" class="btn ghost tiny">试听</button></label>
+      <label class="check"><input id="sSound" type="checkbox" /> 提示音 <button id="sTest" class="btn ghost tiny">试听</button> <button id="sStopSound" class="btn ghost tiny">停止声音</button></label>
+      <label>铃声<select id="sSoundStyle"><option value="alarm">闹钟铃声（约 8 秒）</option><option value="classic">原提示音（短音）</option></select></label>
+      <label>音量（%）<input id="sSoundVolume" type="number" min="0" max="100" step="10" /></label>
       <label class="check"><input id="sAutoOpen" type="checkbox" /> 命中后自动切换到座位页</label>
       <label class="check"><input id="sAutoSeatTab" type="checkbox" /> 启动座位任务时自动打开入场链接</label>
       <label class="check"><input id="sAutoCaptcha" type="checkbox" /> 自动填写文字验证码并验证（本地识别）</label>
