@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "NOL Scout — NOL World 回流票监控助手",
+  "version": "0.7.0",
+  "description": "NOL World / Interpark onestop 选座页回流票捡漏助手：页面即任务，点一下开始扫描，验证码关卡只做计时与聚焦（不代填不提交），命中后精确到座号并给出候选优先级。只做监控/提醒/定位，不自动下单。",
+  "description": "NOL World / Interpark onestop 选座页回流票捡漏助手：页面即任务，点一下开始扫描；显示选座 10 分钟倒计时并在到点自动停止；筛选区域/价位时地图实时标出选中的区块；命中后精确到座号并给出候选优先级。只做监控/提醒/定位，不自动下单。",
+  "permissions": ["storage", "alarms", "notifications", "offscreen", "tabs"],
+  "host_permissions": [
+    "https://world.nol.com/*",
+    "https://tickets.interpark.com/*",
+    "https://api-ticketfront.interpark.com/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "NOL Scout",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://world.nol.com/*"],
+      "js": ["content/product-page.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://tickets.interpark.com/onestop*"],
+      "js": ["content/onestop-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://tickets.interpark.com/onestop*"],
+      "js": ["content/seat-bundle.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}

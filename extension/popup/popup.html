@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo">N</span>
+      <div>
+        <div class="title">NOL Scout</div>
+        <div class="sub">选座页捡漏扫描 · 页面即任务 · 合规版</div>
+      </div>
+    </div>
+    <div id="timeChip" class="chip" title="与 NOL 服务器的时钟偏差">校时中…</div>
+  </header>
+
+  <!-- 捡漏扫描：页面即任务，不再需要「新建监控任务」 -->
+  <section class="panel">
+    <div class="panel-head"><span>捡漏扫描</span><span id="scoutBadge" class="badge stop">未检测到选座页</span></div>
+    <div id="scoutBox" class="scout"></div>
+  </section>
+
+  <!-- 座位页状态 -->
+  <section class="panel">
+    <div class="panel-head"><span>座位页状态</span><span class="muted" id="seatHint">—</span></div>
+    <div class="seat-status" id="seatStatus"></div>
+  </section>
+
+  <!-- 商品页监控（没有座位会话时的兜底） -->
+  <section class="panel">
+    <div class="panel-head" id="formToggle">
+      <span>商品页监控（兜底）</span><span class="caret" id="formCaret">▸</span>
+    </div>
+    <div class="form hidden" id="form">
+      <label>监控模式
+        <select id="fMode">
+          <option value="returns">商品页回流监控（粗粒度 · 不精确到座位）</option>
+          <option value="onSale">开售倒计时监控</option>
+        </select>
+      </label>
+      <label>商品页链接
+        <div class="row">
+          <input id="fUrl2" type="url" placeholder="https://world.nol.com/ticket/places/…/products/…" />
+          <button id="fLoad2" class="btn ghost">解析</button>
+        </div>
+      </label>
+      <div id="fInfo2" class="info hidden"></div>
+      <div class="grid2">
+        <label>并行通道数
+          <input id="fChannels" type="number" min="1" max="4" value="3" />
+        </label>
+        <label>扫描间隔 (ms)
+          <input id="fInterval2" type="number" min="600" step="100" value="800" />
+        </label>
+      </div>
+      <label>关注的票价档位（可多选）
+        <div id="fGrades2" class="chips"><span class="muted">先解析商品页</span></div>
+      </label>
+      <button id="fCreate" class="btn primary">创建任务</button>
+    </div>
+  </section>
+
+  <!-- 任务清单 -->
+  <section class="panel">
+    <div class="panel-head"><span>监控任务清单</span><span id="taskCount" class="muted"></span></div>
+    <div id="taskList" class="tasks"></div>
+  </section>
+
+  <!-- 命中记录 -->
+  <section class="panel">
+    <div class="panel-head" id="hitToggle">
+      <span>命中记录</span>
+      <span><span id="hitCount" class="muted"></span> <span class="caret" id="hitCaret">▸</span></span>
+    </div>
+    <div id="hitView" class="hits hidden"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head" id="logToggle"><span>运行日志</span><span class="caret" id="logCaret">▾</span></div>
+    <div id="logView" class="logs"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head" id="setToggle"><span>⚙ 设置</span><span class="caret" id="setCaret">▾</span></div>
+    <div class="form hidden" id="settings">
+      <label class="check"><input id="sNotify" type="checkbox" /> 浏览器通知</label>
+      <label class="check"><input id="sSound" type="checkbox" /> 提示音 <button id="sTest" class="btn ghost tiny">试听</button></label>
+      <label class="check"><input id="sAutoOpen" type="checkbox" /> 命中后自动切换到座位页</label>
+      <label class="check"><input id="sAutoSeatTab" type="checkbox" /> 启动座位任务时自动打开入场链接</label>
+      <label>全局最小扫描间隔 (ms)
+        <input id="sMinInterval" type="number" min="300" step="100" />
+      </label>
+      <button id="sSave" class="btn primary">保存设置</button>
+    </div>
+  </section>
+
+  <footer class="foot">
+    仅监控与提醒，不自动选座下单 · 请遵守 NOL 条款与当地法律
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
