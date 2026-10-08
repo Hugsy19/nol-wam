@@ -563,6 +563,7 @@ function captchaFinish(ok, why) {
     // 只把「这一关总共花了多久」记下来；答案本身从来不碰
     noteCaptchaCost(c.totalMs, c.attempts, c.kind);
     if (state.monitor) maybeEvaluate('captcha-passed');
+    else maybeStartAfterCaptchaPassed();
   } else {
     log(`🔎 验证码框已消失，但没读到服务端结果（本轮 ${formatElapsed(ms)}）`, 'warn');
   }
@@ -634,6 +635,41 @@ function maybeAutoStartOnGate() {
   if (!state.prefs.captchaAutoStart) return;
   if (!pageReady()) { c.wantAutoStart = true; return; }
   autoStartScan('验证码关卡');
+}
+
+// 只接受服务端明确通过；框消失、低置信度或验证失败均不触发。
+let startingAfterCaptcha = false;
+async function startScanFromCurrentPrefs() {
+  if (state.monitor) return;
+  if (!state.catalog) await ensureCatalog(false);
+  if (state.monitor) return;
+  await startMonitor(adHocTask());
+  state.ui.scopeOpen = false;
+  log(`已按当前范围开始：${describePrefs(state.prefs, { nameOfGrade: gradeNameMap() })}`, 'hit');
+  renderPanel();
+}
+async function maybeStartAfterCaptchaPassed() {
+  const c = C();
+  if (!state.prefs.captchaAutoSolve || c.passed !== true || c.active || state.monitor || startingAfterCaptcha) return;
+  if (timerSnapshot().state === 'dead') return;
+  const session = state.session;
+  startingAfterCaptcha = true;
+  log('验证码已通过，准备自动执行「开始捡漏扫描」');
+  try {
+    // 场次上下文可能稍晚到达，等待它完成，随后走手动按钮相同的目录构建入口。
+    for (let i = 0; i < 60; i++) {
+      if (!state.prefs.captchaAutoSolve || c.passed !== true || c.active || state.monitor || state.session !== session || timerSnapshot().state === 'dead') return;
+      if (state.session && state.goodsCode && state.placeCode && state.playSeq) break;
+      if (i === 0) log('自动开扫正在等待商品与场次信息');
+      await sleep(500);
+    }
+    if (!state.session || !state.goodsCode || !state.placeCode || !state.playSeq) throw new Error('等待场次信息超时，请检查页面');
+    await startScanFromCurrentPrefs();
+  } catch (e) {
+    log('验证通过后自动开扫失败：' + e.message, 'warn');
+  } finally {
+    startingAfterCaptcha = false;
+  }
 }
 
 async function autoStartScan(why) {
@@ -757,6 +793,7 @@ const PREFS_KEY = 'scoutPrefs';
 async function loadPrefs() {
   const st = await chrome.storage.local.get(PREFS_KEY).catch(() => ({}));
   state.prefs = normalizePrefs(st?.[PREFS_KEY] || DEFAULT_SCOUT_PREFS);
+  maybeStartAfterCaptchaPassed();
   return state.prefs;
 }
 
@@ -859,6 +896,7 @@ async function ensureCatalog(force = false) {
   // 目录是在验证码期间才建出来的：如果用户此刻正卡在验证码上、又开了自动开扫开关，
   // 就趁这个机会把扫描拉起来 —— 这就是"那 8 秒不空转"真正落地的地方。
   if (state.captcha.active && state.captcha.wantAutoStart) maybeAutoStartOnGate();
+  else maybeStartAfterCaptchaPassed();
   return catalog;
 }
 
@@ -888,13 +926,25 @@ function targetBlocks(task) {
   return c.blocks.filter((b) => b.seatCount > 0 && scope.has(b.key)).map((b) => b.key);
 }
 
-async function startMonitor(task) {
-  stopMonitor({ quiet: true });
+let monitorStartPromise = null;
+let monitorStartEpoch = 0;
+function startMonitor(task) {
+  // 续扫、消息、自动开扫可能同时到达；重复开始不能停止正在锁票的监控。
+  if (state.monitor) return Promise.resolve({ alreadyRunning: true, blocks: state.monitor.blocks.length });
+  if (state.automation.busy) return Promise.resolve({ alreadyRunning: true, locking: true });
+  if (monitorStartPromise) return monitorStartPromise;
+  const epoch = monitorStartEpoch;
+  monitorStartPromise = startMonitorOnce(task, epoch).finally(() => { monitorStartPromise = null; });
+  return monitorStartPromise;
+}
+async function startMonitorOnce(task, epoch) {
   const t0 = timerSnapshot();
   if (t0.state === 'dead') {
     throw new Error('选座 10 分钟已经用完了（' + (t0.reason === 'server' ? '服务端已判定超时' : '时限已到') + '），请重新排队进入选座页');
   }
   await ensureCatalog(false);
+  if (epoch !== monitorStartEpoch) throw new Error("扫描启动已取消");
+  if (timerSnapshot().state === 'dead') throw new Error("选座会话已过期，未启动扫描");
   if (task.playSeqs?.length && state.playSeq && !task.playSeqs.includes(state.playSeq)) {
     throw new Error(`当前页面是第 ${state.playSeq} 场，不在任务选定场次（${task.playSeqs.join(', ')}）内`);
   }
@@ -916,6 +966,7 @@ async function startMonitor(task) {
 }
 
 function stopMonitor({ quiet = false } = {}) {
+  monitorStartEpoch++;
   if (!state.monitor) return;
   state.monitor.ctrl.abort();
   if (state.automation.busy) pageCommand('cancel').catch(() => {});
@@ -1065,23 +1116,38 @@ async function maybeSolveCaptcha() {
 const pagePending = new Map();
 window.addEventListener('message', ev => {
   const d = ev.data;
-  if (ev.source !== window || ev.origin !== location.origin || d?.__tag !== 'nol-scout-page' || d.type !== 'result') return;
+  if (ev.source !== window || ev.origin !== location.origin || d?.__tag !== 'nol-scout-page' || !['result', 'progress'].includes(d.type)) return;
   const pending = pagePending.get(d.id);
   if (!pending) return;
+  if (d.type === 'progress') {
+    if (pending.action === 'lock' && typeof d.payload?.message === 'string') log('锁票进度：' + d.payload.message);
+    return;
+  }
   pagePending.delete(d.id); clearTimeout(pending.timer); pending.resolve(d.payload);
 });
 function pageCommand(action, payload = {}) {
   return new Promise((resolve, reject) => {
     const id = crypto.randomUUID();
-    const timer = setTimeout(() => { pagePending.delete(id); reject(new Error('页面操作超时')); }, action === 'lock' ? 45000 : 3000);
-    pagePending.set(id, { resolve, timer });
+    const timer = setTimeout(() => { pagePending.delete(id); reject(new Error('页面操作超时')); }, action === 'lock' ? 90000 : 3000);
+    pagePending.set(id, { resolve, timer, action });
     window.postMessage({ __tag: 'nol-scout-page', type: 'command', id, action, payload }, location.origin);
   });
 }
 
+let lastLockSkip = { reason: '', at: 0 };
+function noteLockSkip(reason) {
+  const now = Date.now();
+  if (lastLockSkip.reason === reason && now - lastLockSkip.at < 15000) return;
+  lastLockSkip = { reason, at: now };
+  log('命中但未锁票：' + reason, 'warn');
+}
+
 async function maybeLockBest(run, monitor) {
   const a = state.automation;
-  if (!state.prefs.autoLock || a.busy || a.locked || a.uncertain || timerSnapshot().state === 'dead' || Date.now() - a.lastAttempt < 3000) return;
+  if (!state.prefs.autoLock) { noteLockSkip('自动锁票开关未开启，请在面板中开启'); return; }
+  if (a.busy || a.locked || Date.now() - a.lastAttempt < 3000) return;
+  if (a.uncertain) { noteLockSkip('上次锁票结果未确认，自动操作已暂停，请先检查页面'); return; }
+  if (timerSnapshot().state === 'dead') { noteLockSkip('选座会话已过期'); return; }
   const session = state.session;
   const scene = [state.goodsCode, state.placeCode, state.playSeq].join('|');
   a.busy = true;
@@ -1089,8 +1155,11 @@ async function maybeLockBest(run, monitor) {
   let sent = false;
   try {
     const status = await pageCommand('status');
-    if (!status.verified || status.session !== session) return;
-    if (document.querySelector(CAPTCHA_SEL.box)) return;
+    if (status.error) throw new Error(status.error);
+    if (status.version !== '0.8.9') { noteLockSkip('页面锁票脚本版本不一致，请重新加载插件并刷新购票页面'); return; }
+    if (!status.verified) { noteLockSkip('页面尚未确认验证通过'); return; }
+    if (status.session !== session) { noteLockSkip('页面会话与扫描会话不一致，请重新进入选座页'); return; }
+    if (document.querySelector(CAPTCHA_SEL.box)) { noteLockSkip('验证窗口仍在页面上，等待关闭'); return; }
     if (status.selectedIds?.length) throw new Error('页面已有选中座位，请先人工确认');
     C().passed = true;
     const quantity = monitor.task.quantity || 1;
@@ -1099,7 +1168,7 @@ async function maybeLockBest(run, monitor) {
     const fresh = await getSeatStatus(state, [run.blockKey], ctx(), { signal: monitor.ctrl.signal });
     const block = state.catalog.blocks.find(b => b.key === run.blockKey);
     const flags = decodeBlockStatus(fresh[run.blockKey], block?.seats.length || 0);
-    if (payload.seats.some(s => !flags[block?.seats.findIndex(x => x.id === s.seatInfoId)])) return;
+    if (payload.seats.some(s => !flags[block?.seats.findIndex(x => x.id === s.seatInfoId)])) { noteLockSkip('复核候选座位时已不可购，继续扫描'); return; }
     // 取原始元数据，保留 seatGroupId / floor 等页面原生校验需要的字段。
     const meta = await getSeatMeta(state, [run.blockKey], ctx(), { signal: monitor.ctrl.signal });
     const originals = meta.flatMap(b => b.seats || []);
@@ -1115,19 +1184,19 @@ async function maybeLockBest(run, monitor) {
     const receipt = a.lockReceipt;
     const ids = payload.seats.map(s => s.seatInfoId).sort();
     const receiptMatches = receipt?.ids?.length === ids.length && [...receipt.ids].sort().every((id, i) => id === ids[i]);
-    if (result.outcome === 'locked' && receiptMatches && receipt.outcome === 'locked') {
+    if (result.outcome === 'payment-ready' && receiptMatches && receipt.outcome === 'locked') {
       const selected = { ...run, seats: run.seats.slice(0, quantity), seatNos: run.seatNos.slice(0, quantity), len: quantity };
       a.locked = { seats: payload.seats, summary: hitSummary(selected), at: Date.now() };
-      log(`✅ 锁票成功，已进入票价步骤：${a.locked.summary}`, 'hit');
+      log(`✅ 锁票流程完成，已进入付款界面：${a.locked.summary}`, 'hit');
       notifySoon('锁票成功', a.locked.summary);
       stopMonitor();
     } else {
       a.uncertain = result.uncertain !== false;
-      log(result.error || '尚未同时确认服务器锁票结果和页面跳转，请检查页面', 'warn');
+      log(result.error || '尚未同时确认座位提交结果和进入付款界面，请检查页面', 'warn');
     }
   } catch (e) {
     if (sent) a.uncertain = true;
-    if (!monitor.ctrl.signal.aborted || sent) log(sent ? '页面锁票结果未确认，自动操作暂停，请检查页面' : `锁票前检查失败：${e.message}`, 'warn');
+    if (!monitor.ctrl.signal.aborted || sent) log(sent ? `页面锁票结果未确认，自动操作暂停：${e.message}` : `锁票前检查失败：${e.message}`, 'warn');
   } finally { a.busy = false; renderPanel(); }
 }
 
@@ -1956,11 +2025,7 @@ function bind(root) {
   if (scan) scan.onclick = async () => {
     if (state.monitor) return stopMonitor();
     try {
-      if (!state.catalog) await ensureCatalog(false);
-      await startMonitor(adHocTask());
-      state.ui.scopeOpen = false;
-      log(`已按当前范围开始：${describePrefs(state.prefs, { nameOfGrade: gradeNameMap() })}`, 'hit');
-      renderPanel();
+      await startScanFromCurrentPrefs();
     } catch (e) {
       log('无法开始：' + e.message, 'error');
     }
@@ -2388,6 +2453,7 @@ function sleepInterruptible(ms, ctrl) {
 //   才自动续扫；换了演出就绝不擅自开扫 —— 上次的价位/区域参数对新演出没有意义。
 (async () => {
   await loadPrefs();
+  log("插件版本 0.8.9 · 扫描重复启动不会取消锁票");
   // 面板位置要在面板建出来之前就备好；万一已经先建了（请求抢跑），loadPanelPos 会就地挪过去
   await loadPanelPos();
   // 验证码关卡的观察器：越早挂越好 —— 刷新后可能直接就停在验证码上

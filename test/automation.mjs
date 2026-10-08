@@ -31,14 +31,14 @@ async function scenario({ outcome = 'locked', verified = true, expired = false }
     getSeatStatus: async () => ({ [run.blockKey]: '8' }),
     getSeatMeta: async () => [{ seats: expected.seats }],
     pageCommand: async action => {
-      if (action === 'status') return { verified, session: page.session, selectedIds: [] };
+      if (action === 'status') return { version: '0.8.9', verified, session: page.session, selectedIds: [] };
       calls++;
       if (outcome === 'timeout') throw Error('timeout');
       state.automation.lockReceipt = { ids: run.seats.map(s => s.id), outcome };
-      return outcome === 'locked' ? { outcome: 'locked' } : { error: 'failed', uncertain: true };
+      return outcome === 'locked' ? { outcome: 'payment-ready' } : { error: 'failed', uncertain: true };
     },
     selectSeats: async () => { calls++; if (outcome === 'timeout') throw Error('timeout'); return outcome === 'locked' ? { unselectableSeatInfoIds: [] } : outcome === 'unavailable' ? { unselectableSeatInfoIds: ['taken'] } : {}; },
-    hitSummary: () => 'seat', log: () => {}, notifySoon: () => {}, renderPanel: () => {},
+    noteLockSkip: () => {}, hitSummary: () => 'seat', log: () => {}, notifySoon: () => {}, renderPanel: () => {},
     stopMonitor: () => { stopped = true; state.monitor = null; },
   };
   vm.createContext(sandbox);vm.runInContext(source.slice(start, end), sandbox);

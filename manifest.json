@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NOL Scout — NOL World 回流票监控助手",
-  "version": "0.8.3",
+  "version": "0.8.9",
   "description": "NOL World 选座助手：本地文字验证码识别、按偏好查找座位、可选自动锁票与结果确认。",
   "permissions": [
     "storage",
